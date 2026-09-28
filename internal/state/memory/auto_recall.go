@@ -416,8 +416,20 @@ func buildRecallBlock(hits []RecallHit, budget, omitted int) ([]RecallHit, strin
 	used := utf8.RuneCountInString(prefix + close)
 	for _, hit := range hits {
 		entry := recallEntry(hit, hit.Snippet)
+		// A stale fact's body may be out of date, so it rides the turn as a
+		// pointer to the fact rather than as a fact of its own.
+		if hit.Freshness == FreshnessStale {
+			entry = staleRecallEntry(hit)
+		}
 		remaining := budget - used
 		if utf8.RuneCountInString(entry) > remaining {
+			// A stale pointer is already the smallest useful form: clipping it
+			// would only shed the hint that sends the model to the memory tool,
+			// so drop it and count it like any other budget omission.
+			if hit.Freshness == FreshnessStale {
+				omitted++
+				continue
+			}
 			entry = clippedRecallEntry(hit, remaining)
 		}
 		if entry == "" {
@@ -450,6 +462,20 @@ func recallEntry(hit RecallHit, snippet string) string {
 		NormalizeFactScope(string(memory.Scope)), NormalizeType(string(memory.Type)),
 		hit.Freshness, hit.Score, html.EscapeString(hit.Reason),
 		html.EscapeString(displayTitle(memory.Title, memory.Name)), html.EscapeString(snippet))
+}
+
+// staleRecallEntry renders a stale hit as a pointer rather than a fact of its
+// own: the body may be out of date, so the model gets the identity, the matched
+// terms that explain the recall, and the memory tool to re-read with. Skipping
+// the snippet keeps a fact the preamble already tells the model not to trust
+// from spending recall budget like a fresh one.
+func staleRecallEntry(hit RecallHit) string {
+	memory := hit.Memory
+	return fmt.Sprintf("- id=%s revision=%d scope=%s type=%s freshness=stale reason=%q\n  title: %s — stale; use the memory tool for details\n",
+		html.EscapeString(memory.ID), memory.Revision,
+		NormalizeFactScope(string(memory.Scope)), NormalizeType(string(memory.Type)),
+		html.EscapeString(hit.Reason),
+		html.EscapeString(displayTitle(memory.Title, memory.Name)))
 }
 
 func clippedRecallEntry(hit RecallHit, maxRunes int) string {
