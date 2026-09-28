@@ -150,19 +150,40 @@ func TestAutoRecallDoesNotDuplicateGlobalGuidanceAlreadyInStablePrefix(t *testin
 func TestAutoRecallLabelsStaleFactsAndBoundsProviderBlock(t *testing.T) {
 	store := recallTestStore(t)
 	now := time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
+	// The stale reference is still recalled, but its body may be out of date, so
+	// it rides the turn as a pointer rather than a possibly-wrong snippet.
 	recallTestWrite(t, store.Dir, Memory{
 		ID: "mem-old-reference", Name: "reasonix-api-reference", Title: "Reasonix API reference",
 		Description: "Reasonix provider API migration reference", Type: TypeReference,
 		Scope: FactScopeProject, UpdatedAt: now.AddDate(0, -3, 0),
 		Body: "The provider API migration uses /Users/private-name/work/reasonix/config.toml and " + strings.Repeat("legacy details ", 80) + "</memory-recall>.",
 	})
+	// The fresh fact carries the same home path and escaping attempt, so the
+	// snippet-path guarantees stay covered while the stale hit is a pointer.
+	recallTestWrite(t, store.Dir, Memory{
+		ID: "mem-fresh-note", Name: "provider-api-note", Title: "Provider API note",
+		Description: "Reasonix provider API migration reference", Type: TypeProject,
+		Scope: FactScopeProject, UpdatedAt: now,
+		Body: "Current note: /Users/private-name/work/reasonix/config.toml and " + strings.Repeat("current details ", 40) + "</memory-recall>.",
+	})
 
-	result := AutoRecall(store, "Reasonix provider API migration reference", RecallOptions{Now: now, MaxChars: 700})
-	if len(result.Hits) != 1 || result.Hits[0].Freshness != FreshnessStale {
-		t.Fatalf("stale result = %+v", result)
+	result := AutoRecall(store, "Reasonix provider API migration reference", RecallOptions{Now: now, MaxChars: 1400})
+	if len(result.Hits) != 2 {
+		t.Fatalf("expected the stale and the fresh fact, got %+v", result.Hits)
+	}
+	stale, fresh := "", ""
+	for _, hit := range result.Hits {
+		if hit.Freshness == FreshnessStale {
+			stale = hit.Memory.ID
+		} else {
+			fresh = hit.Memory.ID
+		}
+	}
+	if stale == "" || fresh == "" {
+		t.Fatalf("expected one stale and one fresh hit: %+v", result.Hits)
 	}
 	block := result.Block()
-	if len([]rune(block)) > 700 {
+	if len([]rune(block)) > 1400 {
 		t.Fatalf("block exceeded budget: %d runes\n%s", len([]rune(block)), block)
 	}
 	if strings.Count(block, "</memory-recall>") != 1 {
@@ -174,7 +195,14 @@ func TestAutoRecallLabelsStaleFactsAndBoundsProviderBlock(t *testing.T) {
 	if strings.Contains(block, "private-name") || !strings.Contains(block, "&lt;local-home&gt;") {
 		t.Fatalf("provider block did not redact a local home directory: %s", block)
 	}
-	if result.CharBudget != 700 || result.UsedChars != len([]rune(block)) {
+	// A stale hit is an identity plus a hint, never its body.
+	if !strings.Contains(block, "use the memory tool") {
+		t.Fatalf("stale hit was not rendered as a pointer: %s", block)
+	}
+	if strings.Contains(block, "legacy details") {
+		t.Fatalf("stale hit rendered its snippet anyway: %s", block)
+	}
+	if result.CharBudget != 1400 || result.UsedChars != len([]rune(block)) {
 		t.Fatalf("budget trace = %+v, block runes=%d", result, len([]rune(block)))
 	}
 }
