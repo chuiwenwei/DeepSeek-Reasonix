@@ -216,7 +216,10 @@ func isolateWorkspace() (func(), error) {
 
 // The two arms get separate nonces: reusing one would leave the first arm's
 // answer in a host-readable history for the second to find.
-func runBoundaries(root string) int {
+func runBoundaries(mode, root string) int {
+	started := time.Now()
+	planned := 0
+	repo, _ := os.Getwd()
 	root, err := filepath.Abs(root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -243,6 +246,7 @@ func runBoundaries(root string) int {
 			has   bool
 		}{{cue, true}, {noCue, false}} {
 			name := "index-" + side.scale
+			planned++
 			m, err := runOne(p, t, armFor(side.scale, false), name, root, side.has, false)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s [%s]: %v\n", t.ID, name, err)
@@ -260,7 +264,7 @@ func runBoundaries(root string) int {
 	}
 	reportDeltas(cueSide, noCueSide)
 	fmt.Print(reportStopping(all))
-	return writeResults(root, all)
+	return writeResults(root, batchInfo{Mode: mode, Planned: planned, Started: started, Repo: repo}, all)
 }
 
 // reportDeltas is the paired reading: each task against itself, then pooled.
@@ -302,7 +306,10 @@ func deltaBool(a, b bool) string {
 // runExperiment runs one experiment's tasks across its arms. A dry run drives
 // the same pipeline with a scripted provider: it proves fixture, run, scoring
 // and report hold together before any of it is paid for.
-func runExperiment(experiment, root string, dry bool, tasks []contextTask) int {
+func runExperiment(mode, experiment, root string, dry bool, tasks []contextTask) int {
+	started := time.Now()
+	planned := 0
+	repo, _ := os.Getwd()
 	root, err := filepath.Abs(root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -338,6 +345,7 @@ func runExperiment(experiment, root string, dry bool, tasks []contextTask) int {
 		// test: a bad minute would land entirely on one arm.
 		for _, arm := range shuffledArms(t) {
 			cueVisible := t.Experiment == experimentIndex && cueExpectedVisible(t, arm.scale)
+			planned++
 			m, err := runOne(p, t, armFor(arm.scale, arm.searchOff), arm.name, root, cueVisible, dry)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s [%s]: %v\n", t.ID, arm.name, err)
@@ -359,7 +367,7 @@ func runExperiment(experiment, root string, dry bool, tasks []contextTask) int {
 	if experiment == experimentIndex {
 		reportBoundaries(all)
 	}
-	return writeResults(root, all)
+	return writeResults(root, batchInfo{Mode: mode, Planned: planned, Started: started, Dry: dry, Repo: repo}, all)
 }
 
 func cueExpectedVisible(t contextTask, scale string) bool {
@@ -414,7 +422,7 @@ func writeTrajectories(root string, all []contextMetrics) error {
 	return nil
 }
 
-func writeResults(root string, all []contextMetrics) int {
+func writeResults(root string, info batchInfo, all []contextMetrics) int {
 	path := filepath.Join(root, "results.jsonl")
 	f, err := os.Create(path)
 	if err != nil {
@@ -432,7 +440,11 @@ func writeResults(root string, all []contextMetrics) int {
 		fmt.Fprintln(os.Stderr, "write trajectories:", err)
 		return 2
 	}
-	fmt.Printf("\n%d runs written to %s (with trajectories.jsonl)\n", len(all), path)
+	if err := writeBatchManifest(root, info, all); err != nil {
+		fmt.Fprintln(os.Stderr, "write batch manifest:", err)
+		return 2
+	}
+	fmt.Printf("\n%d runs written to %s (with trajectories.jsonl and batch.json)\n", len(all), path)
 	return 0
 }
 
