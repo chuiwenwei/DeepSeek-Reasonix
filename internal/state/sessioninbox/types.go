@@ -179,15 +179,18 @@ type Capacity struct {
 
 // InboxSnapshot is the frontend-safe view: metadata only, never full bodies.
 type InboxSnapshot struct {
-	SchemaVersion int             `json:"schemaVersion"`
-	Revision      int64           `json:"revision"`
-	Paused        bool            `json:"paused"`
-	Recovered     bool            `json:"recovered"`
-	RecoveredN    int             `json:"recoveredCount,omitempty"`
-	Readonly      bool            `json:"readonly,omitempty"`
-	RunID         string          `json:"runId,omitempty"`
-	Items         []InboxItemMeta `json:"items"`
-	Capacity      Capacity        `json:"capacity"`
+	SchemaVersion int   `json:"schemaVersion"`
+	Revision      int64 `json:"revision"`
+	Paused        bool  `json:"paused"`
+	Recovered     bool  `json:"recovered"`
+	RecoveredN    int   `json:"recoveredCount,omitempty"`
+	// Unrecovered means the queue could not be read at all, so its contents are
+	// unknown. It is how a caller tells an empty queue from an unreadable one.
+	Unrecovered bool            `json:"unrecovered,omitempty"`
+	Readonly    bool            `json:"readonly,omitempty"`
+	RunID       string          `json:"runId,omitempty"`
+	Items       []InboxItemMeta `json:"items"`
+	Capacity    Capacity        `json:"capacity"`
 }
 
 // InboxReceipt is returned after a durable enqueue or admission attempt.
