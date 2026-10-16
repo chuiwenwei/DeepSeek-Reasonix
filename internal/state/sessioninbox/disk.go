@@ -150,7 +150,7 @@ func (s *Store) commitManifestLocked(next *manifest) error {
 	if s.unrecovered {
 		// The queue's bodies could not be read, so no manifest may stand in for
 		// them: overwriting the corrupt bytes would turn "unknown" into "empty".
-		return fmt.Errorf("sessioninbox: queue bodies are unreadable; refusing to overwrite the manifest")
+		return fmt.Errorf("sessioninbox: refusing to overwrite the manifest while the queue bodies are unreadable: %w", ErrUnrecovered)
 	}
 	if err := validateManifest(next, false); err != nil {
 		return fmt.Errorf("sessioninbox: invalid manifest: %w", err)

@@ -178,6 +178,10 @@ type Capacity struct {
 }
 
 // InboxSnapshot is the frontend-safe view: metadata only, never full bodies.
+// ErrUnrecovered reports that the queue bodies could not be read, so no manifest
+// may stand in for them. It is the identity a caller matches instead of the text.
+var ErrUnrecovered = errors.New("sessioninbox.queue_unreadable")
+
 type InboxSnapshot struct {
 	SchemaVersion int   `json:"schemaVersion"`
 	Revision      int64 `json:"revision"`

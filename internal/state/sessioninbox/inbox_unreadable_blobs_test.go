@@ -1,6 +1,7 @@
 package sessioninbox
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,6 +139,8 @@ func TestCorruptManifestWithUnreadableBlobsIsNotEmptyQueue(t *testing.T) {
 	// A later mutation must not be able to clear the evidence either.
 	if err := s2.SetPaused(false); err == nil {
 		t.Fatalf("unpausing an unreadable queue succeeded; manifest now %s", readManifestBytes(t, session))
+	} else if !errors.Is(err, ErrUnrecovered) {
+		t.Fatalf("the refusal lost its identity: %v", err)
 	}
 	if got := readManifestBytes(t, session); got != man {
 		t.Fatalf("a refused mutation still rewrote the manifest: %s", got)

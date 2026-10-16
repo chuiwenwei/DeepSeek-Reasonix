@@ -287,13 +287,16 @@ func (c *Controller) rebindInbox() {
 	if snap.Unrecovered {
 		// As in ensureInbox: say the contents are unknown, never a count.
 		dir := st.Dir()
-		go func() { c.sink.Emit(inboxUnrecoveredNotice(dir)) }()
+		// Capture the sink: New writes c.sink right after this call returns.
+		sink := c.sink
+		go func() { sink.Emit(inboxUnrecoveredNotice(dir)) }()
 		return
 	}
 	if snap.Recovered && snap.RecoveredN > 0 {
 		// Emit after unlock via deferred sink call would race; emit here.
+		sink := c.sink
 		go func(n int) {
-			c.sink.Emit(inboxRecoveredNotice(n))
+			sink.Emit(inboxRecoveredNotice(n))
 		}(snap.RecoveredN)
 		sessioninbox.NoteRecovered(snap.RecoveredN)
 	}
