@@ -1,5 +1,6 @@
 {
   "limits": {
+    "atomic-write": 0,
     "banner": 0,
     "build-artifact": 0,
     "claude-dialect": 1,

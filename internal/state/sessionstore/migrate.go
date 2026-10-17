@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"reasonix/internal/base/fileutil"
 	fileencoding "reasonix/internal/base/fileutil/encoding"
 	"reasonix/internal/contract/provider"
 	"reasonix/internal/state/store"
@@ -633,11 +634,9 @@ func recordImportedTitle(destDir, base, summary string) {
 	if err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := fileutil.AtomicWriteFile(path, b, 0o644); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, path)
 }
 
 func importMarkerExists(destDir, marker string) bool {

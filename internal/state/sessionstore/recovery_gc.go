@@ -599,7 +599,7 @@ func writeRecoveryTrashMeta(itemDir, key string) error {
 	if err := os.MkdirAll(itemDir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(itemDir, recoveryTrashMetaFile), b, 0o644)
+	return fileutil.AtomicWriteFile(filepath.Join(itemDir, recoveryTrashMetaFile), b, 0o644)
 }
 
 func writeRecoveryTrashMetaExisting(itemDir, key string) error {
@@ -608,7 +608,7 @@ func writeRecoveryTrashMetaExisting(itemDir, key string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(itemDir, recoveryTrashMetaFile), b, 0o644)
+	return fileutil.AtomicOverwriteFile(filepath.Join(itemDir, recoveryTrashMetaFile), b, 0o644)
 }
 
 func recoveryTrashSidecars(path string) []string {

@@ -55,7 +55,7 @@ var allRules = []string{
 	ruleClaudeDialect, ruleWireParity, ruleOrphan,
 	ruleFrontendParity, ruleFlatView, ruleBuildArtifact,
 	ruleCodeOwners, ruleDocOwner, ruleDocProse, ruleDocLanguage, ruleReleaseNote,
-	ruleCSSImportant, ruleCSSSize, ruleStrayFile,
+	ruleCSSImportant, ruleCSSSize, ruleStrayFile, ruleAtomicWrite,
 }
 
 func main() {
@@ -189,6 +189,7 @@ func run(root string) ([]Finding, error) {
 		findings = append(findings, checkErrorText(src)...)
 		findings = append(findings, checkFlatView(src)...)
 		findings = append(findings, checkWindowState(src)...)
+		findings = append(findings, checkAtomicWrite(src)...)
 		orphans.observe(src)
 		wires.observe(src)
 		entries, vars := dialectRefs(src)
