@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,15 @@ const (
 	// denominatorUnit and denominatorDefinition say what pass@1 divides by.
 	denominatorUnit       = "task"
 	denominatorDefinition = "first attempts of solvable, non-skipped tasks: pass@1 divides passes by this count, never by the retained row count"
+	// Swe-bench grades instances, not this repo's task directories, and its
+	// verdict comes from the official harness. The unit therefore has to be
+	// named separately or a reader would divide by the row count.
+	swebenchDenominatorUnit       = "instance"
+	swebenchDenominatorDefinition = "graded SWE-bench instances: each instance's official verdict is one unit, and a solve counts only when the grader resolves it; the row count is never this denominator"
+	// Diff mode grades one pull request by generating tests for it. Attempts are
+	// retries, not independent units, so the denominator is the PR.
+	diffDenominatorUnit       = "pull request"
+	diffDenominatorDefinition = "the pull request under test: the report publishes one verdict chosen from the retained attempt rows, so the accuracy denominator is the PR, not the attempts"
 	// batchRetention is the one line a reader needs before sharing the batch.
 	batchRetention = "results.jsonl is retained unredacted beside this manifest (task prompts and agent notes included) and is not public; the manifest carries a task-id digest, no prompt text, no absolute paths, no endpoints or keys and no model output"
 )
@@ -168,10 +178,39 @@ var ledgerDefinitions = map[string]string{
 	"skipped":    "planned runs deliberately not started (anchor has no seed, or the token budget ran out)",
 }
 
+// swebenchLedgerDefinitions renames the two counts whose unit differs: the
+// plan is the instance subset, and the denominator is the grader's verdict.
+var swebenchLedgerDefinitions = withLedgerDefinitions(ledgerDefinitions, map[string]string{
+	"planned": "instances in the -subset file: one graded run each",
+	"scored":  "instances the official harness graded: the pass@1 denominator",
+	"excluded": "rows kept out of the score; none in this mode unless an instance " +
+		"never reached a row",
+})
+
+// diffLedgerDefinitions renames the counts whose unit is the PR, not a task:
+// the retry rows are evidence, and the published verdict is the denominator.
+var diffLedgerDefinitions = withLedgerDefinitions(ledgerDefinitions, map[string]string{
+	"planned":    "generation attempts the harness made on this PR (the -attempts budget is an axis)",
+	"scored":     "the pull request: one verdict chosen from the retained attempts, never the attempt count",
+	"failed":     "the PR whose chosen attempt did not pass",
+	"excluded":   "attempts kept out of the accuracy denominator: every attempt not chosen for the published verdict",
+	"unmeasured": "attempts whose cost and tokens are unknown because no metrics landed; kept out of spend totals",
+})
+
+// withLedgerDefinitions copies base and applies overrides, so a mode states
+// only the counts whose meaning differs from the suite's.
+func withLedgerDefinitions(base, overrides map[string]string) map[string]string {
+	out := make(map[string]string, len(base))
+	maps.Copy(out, base)
+	maps.Copy(out, overrides)
+	return out
+}
+
 // batchProvenance is what the batch knows before any run happens. Everything
 // else in the manifest is derived from the rows that were written.
 type batchProvenance struct {
 	dir      string
+	mode     string
 	started  time.Time
 	planned  int
 	axes     []batchFlag
@@ -190,21 +229,44 @@ func captureBatchProvenance(dir string, cfg suiteConfig, tasks []task, taskFilte
 	model, provider := modelIdentity(cfg.model)
 	count, digest := taskSetDigest(tasks)
 	return batchProvenance{
-		dir: dir, started: time.Now().UTC(), planned: count * max(cfg.trials, 1),
+		dir: dir, mode: "suite", started: time.Now().UTC(), planned: count * max(cfg.trials, 1),
 		axes: batchAxes(cfg), tasks: batchTaskSet{Count: count, Digest: digest},
 		filters: batchFilters{Task: taskFilter},
 		commit:  commit, dirty: dirty, model: model, provider: provider,
 	}
 }
 
+// modeTakesBatch reports whether -batch means anything for a mode: the three
+// writers, plus audit, which reads what they wrote.
+func modeTakesBatch(mode string) bool {
+	switch mode {
+	case "suite", "swebench", "diff", "audit":
+		return true
+	}
+	return false
+}
+
 // writeBatch writes the rows first and the manifest second, so a manifest
 // never describes rows that are not beside it.
 func writeBatch(p batchProvenance, results []result) error {
-	if err := os.MkdirAll(p.dir, 0o750); err != nil {
+	rows := make([]any, len(results))
+	for i := range results {
+		rows[i] = results[i]
+	}
+	return writeBatchRows(p.dir, rows, func(resultsSHA256 string) batchManifest {
+		return buildBatchManifest(p, results, resultsSHA256)
+	})
+}
+
+// writeBatchRows is the one writer every batch-producing mode uses. It retains
+// the rows unredacted, then the manifest describes what is already on disk, so
+// the modes differ only in the figures they publish, never in the format.
+func writeBatchRows(dir string, rows []any, build func(resultsSHA256 string) batchManifest) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create batch directory: %w", err)
 	}
 	var raw, canonical bytes.Buffer
-	for _, r := range results {
+	for _, r := range rows {
 		line, err := json.Marshal(r)
 		if err != nil {
 			return fmt.Errorf("encode row: %w", err)
@@ -219,35 +281,40 @@ func writeBatch(p batchProvenance, results []result) error {
 		canonical.WriteByte('\n')
 	}
 	// Rows carry task prompts and agent notes, so they stay the operator's.
-	if err := os.WriteFile(filepath.Join(p.dir, batchResultsName), raw.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, batchResultsName), raw.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", batchResultsName, err)
 	}
-	manifest := buildBatchManifest(p, results, canonical.Bytes())
+	manifest := build(hashOf(canonical.Bytes()))
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode manifest: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(p.dir, batchManifestName), append(b, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, batchManifestName), append(b, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", batchManifestName, err)
 	}
 	return nil
 }
 
-func buildBatchManifest(p batchProvenance, results []result, canonical []byte) batchManifest {
-	stats := gatherSuiteStats(results)
+// buildManifest fills the field groups every mode shares: what the figures are
+// over, which run produced them, and why they can still be checked.
+func buildManifest(p batchProvenance, denom batchDenominator, claims batchClaims, ledger batchLedger, resultsSHA256 string) batchManifest {
 	harness, goVersion := harnessIdentity()
 	source := ""
 	if p.commit != "unknown" {
 		source = "checkout"
 	}
+	mode := p.mode
+	if strings.TrimSpace(mode) == "" {
+		mode = "suite"
+	}
 	return batchManifest{
 		SchemaVersion: batchSchemaVersion,
 		Scope:         batchScope,
 		Over: batchOver{
-			Command:     batchCommand{Mode: "suite", Axes: p.axes},
+			Command:     batchCommand{Mode: mode, Axes: p.axes},
 			Tasks:       p.tasks,
 			Filters:     p.filters,
-			Denominator: batchDenominator{Unit: denominatorUnit, Definition: denominatorDefinition, Value: stats.ran},
+			Denominator: denom,
 		},
 		Producer: batchProducer{
 			Commit: p.commit, CommitSource: source, Dirty: p.dirty,
@@ -256,12 +323,19 @@ func buildBatchManifest(p batchProvenance, results []result, canonical []byte) b
 			HarnessVersion: harness, GoVersion: goVersion,
 		},
 		Trust: batchTrust{
-			ResultsSHA256: hashOf(canonical),
-			Claimed:       claimsFor(stats),
-			Ledger:        ledgerFor(results, p.planned),
+			ResultsSHA256: resultsSHA256,
+			Claimed:       claims,
+			Ledger:        ledger,
 			Retention:     batchRetention,
 		},
 	}
+}
+
+func buildBatchManifest(p batchProvenance, results []result, resultsSHA256 string) batchManifest {
+	stats := gatherSuiteStats(results)
+	return buildManifest(p,
+		batchDenominator{Unit: denominatorUnit, Definition: denominatorDefinition, Value: stats.ran},
+		claimsFor(stats), ledgerFor(results, p.planned), resultsSHA256)
 }
 
 // claimsFor publishes the report's headline figures. Without a single
@@ -400,9 +474,16 @@ func taskSetDigest(tasks []task) (int, string) {
 	for i, t := range tasks {
 		ids[i] = t.ID
 	}
-	sort.Strings(ids)
-	sum := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
-	return len(ids), "sha256:" + hex.EncodeToString(sum[:])
+	return idSetDigest(ids)
+}
+
+// idSetDigest is taskSetDigest for a mode whose units are not task directories:
+// SWE-bench instance ids and a PR's changed files fingerprint the same way.
+func idSetDigest(ids []string) (int, string) {
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
+	return len(sorted), "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // batchAxes lists the flags that change what a figure means, with their

@@ -259,7 +259,7 @@ func main() {
 	forcePlanner := flag.Bool("force-planner", false, "suite mode: prefix each prompt with a plan-first directive so the two-model turn engages regardless of the planner gate")
 	anchorFlag := flag.String("anchor", anchorBlind, "suite mode: hypothesis arm — blind (no hypothesis) | correct | wrong; correct/wrong prefix each prompt with the task's authored seed and skip tasks that have none")
 	outJSON := flag.String("json", "", "write the JSON report here (optional)")
-	batchDir := flag.String("batch", "", "suite mode: write results.jsonl (one row per run) and batch.json (manifest v1) here, so a later -mode audit can re-derive the report's figures; audit mode: read the batch from here")
+	batchDir := flag.String("batch", "", "suite/swebench/diff mode: write results.jsonl (one row per run or attempt) and batch.json (manifest v1) here, so a later -mode audit can re-derive the report's figures; audit mode: read the batch from here")
 	budget := flag.Int("budget", defaultSuiteTokenBudget, "abort once total tokens cross this (0 = no cap)")
 	// diff-mode flags
 	repo := flag.String("repo", ".", "repo root (diff mode)")
@@ -282,8 +282,8 @@ func main() {
 		os.Exit(2)
 	}
 	profile, arm, cache, anchor := axes.profile, axes.arm, axes.cache, axes.anchor
-	if *batchDir != "" && *mode != "suite" && *mode != "audit" {
-		fmt.Fprintln(os.Stderr, "e2ebench: -batch is written by -mode suite and read by -mode audit; -mode "+*mode+" does neither")
+	if *batchDir != "" && !modeTakesBatch(*mode) {
+		fmt.Fprintln(os.Stderr, "e2ebench: -batch is written by -mode suite|swebench|diff and read by -mode audit; -mode "+*mode+" does neither")
 		os.Exit(2)
 	}
 
@@ -298,7 +298,7 @@ func main() {
 			profile: profile, permission: *permission, arm: arm, runID: *runID, workDir: cwd,
 			harness: *harnessPy, dataset: *dataset, maxSteps: *maxSteps,
 			timeoutSec: *timeoutSec, workers: *workers, keepImages: *keepImages,
-			network: *network, proxyURL: *proxyURL,
+			batchDir: *batchDir, network: *network, proxyURL: *proxyURL,
 		})
 		emit(report, *outMD, "")
 		if *outJSON != "" {
@@ -318,6 +318,7 @@ func main() {
 		report := runDiff(diffOpts{
 			bin: *bin, model: *model, repo: *repo, base: *base,
 			testCmd: *testCmd, profile: profile, ablate: arm, maxSteps: *maxSteps, timeoutSec: *timeoutSec, attempts: *attempts,
+			batchDir: *batchDir,
 		})
 		emit(report, *outMD, "")
 		return

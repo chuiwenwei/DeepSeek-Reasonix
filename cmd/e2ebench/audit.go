@@ -27,7 +27,7 @@ func runAuditMode(dir, outMD string) error {
 // them against batch.json. It reports both sides and never re-runs anything.
 func auditBatch(dir string) (string, error) {
 	if strings.TrimSpace(dir) == "" {
-		return "", errors.New("audit needs -batch <directory>: the directory a suite run wrote")
+		return "", errors.New("audit needs -batch <directory>: the directory a batch run wrote")
 	}
 	manifestPath := filepath.Join(dir, batchManifestName)
 	data, err := os.ReadFile(manifestPath)
@@ -48,22 +48,26 @@ func auditBatch(dir string) (string, error) {
 		return "", fmt.Errorf("%s records no commit (%q): the figures cannot be tied to a version, so this audit stops", batchManifestName, m.Producer.Commit)
 	}
 
-	rows, canonical, err := readBatch(filepath.Join(dir, batchResultsName))
+	rows, canonical, err := readBatchLines(filepath.Join(dir, batchResultsName))
 	if err != nil {
 		return "", err
 	}
 	hash := hashOf(canonical)
-	stats := gatherSuiteStats(rows)
-	fromRows := ledgerFromRows(rows)
-	figures, failures := compareClaims(m.Trust.Claimed, stats)
-	ledger, ledgerFailures := compareLedger(m.Trust.Ledger, fromRows)
+	expected, err := auditExpectations(m, rows)
+	if err != nil {
+		return "", err
+	}
+	failures := append([]string(nil), expected.extraFailures...)
+	figures, claimFailures := compareClaims(m.Trust.Claimed, expected.claims, expected.requiredClaims)
+	failures = append(failures, claimFailures...)
+	ledger, ledgerFailures := compareLedger(m.Trust.Ledger, expected.ledger)
 	failures = append(failures, ledgerFailures...)
 	failures = append(failures, ledgerInvariants(m.Trust.Ledger)...)
-	failures = append(failures, denominatorChecks(m, fromRows)...)
+	failures = append(failures, denominatorChecks(m, expected.ledger, expected.unit, expected.definition)...)
 	if hash != m.Trust.ResultsSHA256 {
 		failures = append([]string{fmt.Sprintf("results_sha256: manifest %s, rows %s", textOrUnknown(m.Trust.ResultsSHA256), hash)}, failures...)
 	}
-	report := renderAudit(dir, m, rows, hash, figures, ledger, failures)
+	report := renderAudit(dir, m, expected.rowCount, hash, figures, ledger, failures, expected.caveats)
 	if len(failures) > 0 {
 		return report, fmt.Errorf("%d mismatch(es): the published figures do not follow from the retained rows", len(failures))
 	}
@@ -73,9 +77,87 @@ func auditBatch(dir string) (string, error) {
 	return report, nil
 }
 
-// readBatch parses results.jsonl once: the typed rows the figures come from,
-// and the canonical bytes results_sha256 covers.
-func readBatch(path string) ([]result, []byte, error) {
+// auditTarget is what a mode's own aggregation re-derives from the rows: the
+// claimed figures, the ledger, the denominator's unit, and what this audit
+// cannot re-derive for that mode.
+type auditTarget struct {
+	claims         batchClaims
+	ledger         batchLedger
+	unit           string
+	definition     string
+	requiredClaims map[string]bool
+	caveats        []string
+	extraFailures  []string
+	rowCount       int
+}
+
+var (
+	suiteRequiredClaims = map[string]bool{"solved": true, "pass1": true, "accounted": true, "unaccounted": true, "partial": true}
+	// Diff mode never reads the in-flight snapshot a killed agent leaves, so it
+	// cannot know the partial count: the claim is absent, and this audit must
+	// read that as unknown rather than require a zero it did not observe.
+	diffRequiredClaims = map[string]bool{"solved": true, "pass1": true, "accounted": true, "unaccounted": true}
+)
+
+// auditExpectations dispatches on the manifest's own mode. Each mode is checked
+// with the aggregation that produced its report; a mode this audit does not
+// implement is refused by name instead of checked against another mode's rules.
+func auditExpectations(m batchManifest, rows []batchRow) (auditTarget, error) {
+	mode := strings.TrimSpace(m.Over.Command.Mode)
+	switch mode {
+	case "suite", "swebench":
+		results, err := decodeRows[result](rows)
+		if err != nil {
+			return auditTarget{}, err
+		}
+		stats := gatherSuiteStats(results)
+		exp := auditTarget{
+			claims:         observedClaimsFromStats(stats),
+			ledger:         ledgerFromRows(results),
+			requiredClaims: suiteRequiredClaims,
+			rowCount:       len(results),
+		}
+		if mode == "swebench" {
+			exp.unit, exp.definition = swebenchDenominatorUnit, swebenchDenominatorDefinition
+			exp.caveats = []string{
+				"the official harness's per-instance verdict is retained in each row (`passed`/`outcome`); the audit re-derives the published totals from those verdicts but does not re-run the grader",
+				"the container's filesystem and the official test set are not retained, so a row's verdict can be checked against the grader report it came from, not re-executed",
+			}
+		} else {
+			exp.unit, exp.definition = denominatorUnit, denominatorDefinition
+		}
+		return exp, nil
+	case "diff":
+		attempts, err := decodeRows[diffBatchRow](rows)
+		if err != nil {
+			return auditTarget{}, err
+		}
+		claims, ledger, _, selectionFailures := diffFigures(attempts)
+		return auditTarget{
+			claims: claims, ledger: ledger,
+			unit: diffDenominatorUnit, definition: diffDenominatorDefinition,
+			requiredClaims: diffRequiredClaims,
+			caveats: []string{
+				"the attempt chosen for the published verdict is retained in the row's `selected` flag; the audit checks that exactly one attempt is selected and that the verdict follows from it, but does not re-run the comparison that chose it",
+				"`partial` is not measured in diff mode (no in-flight snapshot is read), so an absent partial count is unknown, never zero",
+			},
+			extraFailures: selectionFailures,
+			rowCount:      len(attempts),
+		}, nil
+	default:
+		return auditTarget{}, fmt.Errorf("%s records mode %q, which this audit does not implement; the batch cannot be checked by another mode's rules", batchManifestName, mode)
+	}
+}
+
+// batchRow is one line of results.jsonl, kept raw so the mode decides its type.
+type batchRow struct {
+	line int
+	raw  []byte
+}
+
+// readBatchLines parses results.jsonl once: the raw rows each mode decodes
+// with its own type, and the canonical bytes results_sha256 covers.
+func readBatchLines(path string) ([]batchRow, []byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -86,7 +168,7 @@ func readBatch(path string) ([]result, []byte, error) {
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		return nil, nil, fmt.Errorf("%s does not end in a newline: its last row is truncated", batchResultsName)
 	}
-	var rows []result
+	var rows []batchRow
 	var canonical bytes.Buffer
 	line := 0
 	for raw := range bytes.SplitSeq(data, []byte("\n")) {
@@ -94,11 +176,10 @@ func readBatch(path string) ([]result, []byte, error) {
 			continue
 		}
 		line++
-		var r result
-		if err := json.Unmarshal(raw, &r); err != nil {
-			return nil, nil, fmt.Errorf("%s line %d is not a complete row (truncated or corrupt): %w", batchResultsName, line, err)
+		if !json.Valid(raw) {
+			return nil, nil, fmt.Errorf("%s line %d is not a complete row (truncated or corrupt)", batchResultsName, line)
 		}
-		rows = append(rows, r)
+		rows = append(rows, batchRow{line: line, raw: append([]byte(nil), raw...)})
 		canon, err := canonicalJSON(raw)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%s line %d: %w", batchResultsName, line, err)
@@ -107,6 +188,51 @@ func readBatch(path string) ([]result, []byte, error) {
 		canonical.WriteByte('\n')
 	}
 	return rows, canonical.Bytes(), nil
+}
+
+// decodeRows decodes the retained lines as the mode's row type. A row that
+// does not decode is a truncated or corrupt row, never an empty one.
+func decodeRows[T any](rows []batchRow) ([]T, error) {
+	out := make([]T, 0, len(rows))
+	for _, row := range rows {
+		var v T
+		if err := json.Unmarshal(row.raw, &v); err != nil {
+			return nil, fmt.Errorf("%s line %d is not a complete row (truncated or corrupt): %w", batchResultsName, row.line, err)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// readBatch parses results.jsonl once: the typed rows the figures come from,
+// and the canonical bytes results_sha256 covers.
+func readBatch(path string) ([]result, []byte, error) {
+	rows, canonical, err := readBatchLines(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	typed, err := decodeRows[result](rows)
+	if err != nil {
+		return nil, nil, err
+	}
+	return typed, canonical, nil
+}
+
+// observedClaimsFromStats is what the rows say, with no omission rules: the
+// audit must see a zero where the rows measured zero, so it can tell that
+// apart from a figure the mode never measured.
+func observedClaimsFromStats(s suiteStats) batchClaims {
+	c := batchClaims{
+		Solved: new(s.passed), Pass1: new(s.pass1),
+		PromptTokens: new(s.pTok), CompletionTokens: new(s.cTok),
+		CacheHitTokens: new(s.hit), CacheMissTokens: new(s.miss),
+		Cost: new(s.cost), Currency: s.currency,
+		Accounted: new(s.accounted), Unaccounted: new(s.unaccounted), Partial: new(s.partial),
+	}
+	if len(s.ttcs) > 0 {
+		c.TCTSMedianMs = new(median(s.ttcs))
+	}
+	return c
 }
 
 // auditFigure is one number on both sides: what the manifest claimed and what
@@ -119,25 +245,24 @@ type auditFigure struct {
 	moved   bool
 }
 
-func compareClaims(c batchClaims, s suiteStats) ([]auditFigure, []string) {
+func compareClaims(c, observed batchClaims, required map[string]bool) ([]auditFigure, []string) {
 	rows := []struct {
-		name     string
-		claimed  string
-		actual   string
-		required bool
+		name    string
+		claimed string
+		actual  string
 	}{
-		{"solved", intText(c.Solved), strconv.Itoa(s.passed), true},
-		{"pass1", intText(c.Pass1), strconv.Itoa(s.pass1), true},
-		{"prompt_tokens", intText(c.PromptTokens), strconv.Itoa(s.pTok), false},
-		{"completion_tokens", intText(c.CompletionTokens), strconv.Itoa(s.cTok), false},
-		{"cache_hit_tokens", intText(c.CacheHitTokens), strconv.Itoa(s.hit), false},
-		{"cache_miss_tokens", intText(c.CacheMissTokens), strconv.Itoa(s.miss), false},
-		{"cost", floatText(c.Cost), floatText(new(s.cost)), false},
-		{"currency", c.Currency, s.currency, false},
-		{"accounted", intText(c.Accounted), strconv.Itoa(s.accounted), true},
-		{"unaccounted", intText(c.Unaccounted), strconv.Itoa(s.unaccounted), true},
-		{"partial", intText(c.Partial), strconv.Itoa(s.partial), true},
-		{"tcts_median_ms", int64Text(c.TCTSMedianMs), strconv.FormatInt(median(s.ttcs), 10), false},
+		{"solved", intText(c.Solved), intText(observed.Solved)},
+		{"pass1", intText(c.Pass1), intText(observed.Pass1)},
+		{"prompt_tokens", intText(c.PromptTokens), intText(observed.PromptTokens)},
+		{"completion_tokens", intText(c.CompletionTokens), intText(observed.CompletionTokens)},
+		{"cache_hit_tokens", intText(c.CacheHitTokens), intText(observed.CacheHitTokens)},
+		{"cache_miss_tokens", intText(c.CacheMissTokens), intText(observed.CacheMissTokens)},
+		{"cost", floatText(c.Cost), floatText(observed.Cost)},
+		{"currency", c.Currency, observed.Currency},
+		{"accounted", intText(c.Accounted), intText(observed.Accounted)},
+		{"unaccounted", intText(c.Unaccounted), intText(observed.Unaccounted)},
+		{"partial", intText(c.Partial), intText(observed.Partial)},
+		{"tcts_median_ms", int64Text(c.TCTSMedianMs), int64Text(observed.TCTSMedianMs)},
 	}
 	var figures []auditFigure
 	var failures []string
@@ -147,10 +272,20 @@ func compareClaims(c batchClaims, s suiteStats) ([]auditFigure, []string) {
 		case row.claimed == "":
 			f.claimed = "unknown"
 			f.note = "not claimed"
-			if row.required {
+			if required[row.name] {
 				f.note = "required, absent"
 				failures = append(failures, row.name+": the manifest claims no "+row.name+"; an absent figure is required here")
 			}
+			if row.actual == "" {
+				f.actual = "unknown"
+				f.note = joinNote(f.note, "not measured in this mode")
+			}
+		case row.actual == "":
+			// The manifest publishes a figure its rows do not carry: that is a
+			// claim, not a measurement, and it cannot follow from the rows.
+			f.actual = "unknown"
+			f.moved = true
+			failures = append(failures, row.name+": the manifest claims a figure these rows do not measure")
 		case row.claimed != row.actual:
 			f.moved = true
 			failures = append(failures, fmt.Sprintf("%s: manifest %s, rows %s", row.name, row.claimed, row.actual))
@@ -235,11 +370,13 @@ func ledgerInvariants(l batchLedger) []string {
 }
 
 // denominatorChecks ties the published denominator to the ledger and to the
-// outcome split, so passes and failures have to add up to it.
-func denominatorChecks(m batchManifest, fromRows batchLedger) []string {
+// outcome split, so passes and failures have to add up to it. The unit and
+// definition are the mode's own: a task count cannot stand in for instances or
+// for one PR.
+func denominatorChecks(m batchManifest, fromRows batchLedger, unit, definition string) []string {
 	var out []string
 	d := m.Over.Denominator
-	if d.Unit != denominatorUnit || d.Definition != denominatorDefinition {
+	if d.Unit != unit || d.Definition != definition {
 		out = append(out, "denominator: the manifest defines it as "+strconv.Quote(d.Unit+" / "+d.Definition)+", which this audit does not implement")
 	}
 	if fromRows.Scored != nil && d.Value != *fromRows.Scored {
@@ -274,15 +411,15 @@ func recordAuditReceipt(manifestPath string, m batchManifest, hash string) error
 	return nil
 }
 
-func renderAudit(dir string, m batchManifest, rows []result, hash string, figures, ledger []auditFigure, failures []string) string {
+func renderAudit(dir string, m batchManifest, rowCount int, hash string, figures, ledger []auditFigure, failures, caveats []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## e2ebench batch audit — `%s`\n\n", filepath.Base(strings.TrimSpace(dir)))
 	b.WriteString("**What the figures are over**\n\n")
 	fmt.Fprintf(&b, "- schema: manifest v%d, audited by `%s/%d`\n", m.SchemaVersion, auditToolName, auditToolVersion)
 	fmt.Fprintf(&b, "- command: `%s` · axes: %s\n", m.Over.Command.Mode, axisText(m.Over.Command.Axes))
-	fmt.Fprintf(&b, "- task ids: `%s` (%d ids; task text is represented by this digest, not stored)\n", textOrUnknown(m.Over.Tasks.Digest), m.Over.Tasks.Count)
-	fmt.Fprintf(&b, "- filters: %s\n", filterText(m.Over.Filters))
-	fmt.Fprintf(&b, "- denominator: **%d %ss** — %s\n", m.Over.Denominator.Value, m.Over.Denominator.Unit, m.Over.Denominator.Definition)
+	fmt.Fprintf(&b, "- %s: `%s` (%d ids; the text is represented by this digest, not stored)\n", unitLabel(m.Over.Command.Mode), textOrUnknown(m.Over.Tasks.Digest), m.Over.Tasks.Count)
+	fmt.Fprintf(&b, "- filters: %s\n", filterTextFor(m.Over.Command.Mode, m.Over.Filters))
+	fmt.Fprintf(&b, "- denominator: **%d %s** — %s\n", m.Over.Denominator.Value, denominatorText(m.Over.Denominator.Unit, m.Over.Denominator.Value), m.Over.Denominator.Definition)
 	b.WriteString("\n**Which run produced them**\n\n")
 	fmt.Fprintf(&b, "- commit: `%s` (%s, %s)\n", m.Producer.Commit, sourceText(m.Producer.CommitSource), dirtyText(m.Producer.Dirty))
 	fmt.Fprintf(&b, "- model: %s · provider: %s\n", nameText(m.Producer.Model), nameText(m.Producer.Provider))
@@ -290,7 +427,7 @@ func renderAudit(dir string, m batchManifest, rows []result, hash string, figure
 	fmt.Fprintf(&b, "- started: %s · finished: %s\n", m.Producer.StartedAt, m.Producer.FinishedAt)
 	fmt.Fprintf(&b, "- harness: %s · runtime %s\n", m.Producer.HarnessVersion, m.Producer.GoVersion)
 	b.WriteString("\n**Why they can still be trusted**\n\n")
-	fmt.Fprintf(&b, "- rows retained: %d in `%s`\n", len(rows), batchResultsName)
+	fmt.Fprintf(&b, "- rows retained: %d in `%s`\n", rowCount, batchResultsName)
 	fmt.Fprintf(&b, "- results_sha256: %s\n", hashText(m.Trust.ResultsSHA256, hash))
 	if m.Audit != nil {
 		fmt.Fprintf(&b, "- last verified by `%s/%d` at %s over `%s`\n", auditToolName, m.Audit.VerifierVersion, m.Audit.VerifiedAt, m.Audit.ResultsSHA256)
@@ -308,6 +445,13 @@ func renderAudit(dir string, m batchManifest, rows []result, hash string, figure
 		}
 		b.WriteString("\n")
 	}
+	if len(caveats) > 0 {
+		b.WriteString("**What this mode's audit does not re-derive**\n\n")
+		for _, c := range caveats {
+			fmt.Fprintf(&b, "- %s\n", c)
+		}
+		b.WriteString("\n")
+	}
 	if len(failures) > 0 {
 		fmt.Fprintf(&b, "**Verdict:** the published figures do **not** follow from the retained rows (%d mismatch(es)).\n\n", len(failures))
 	} else {
@@ -315,6 +459,28 @@ func renderAudit(dir string, m batchManifest, rows []result, hash string, figure
 	}
 	b.WriteString("<sub>An aggregation audit, not a reproduction: the model, tools and environment are not re-executed, so this cannot show the experiment would reproduce. A real replay would need the commit, corpus fingerprint, model and provider configuration, seed, flags, raw results and runtime version; it is not implemented.</sub>\n")
 	return b.String()
+}
+
+// denominatorText pluralizes the unit without changing the suite's existing
+// line ("3 tasks"): only the PR unit has a singular form worth printing.
+func denominatorText(unit string, n int) string {
+	if unit == diffDenominatorUnit && n == 1 {
+		return unit
+	}
+	return unit + "s"
+}
+
+// unitLabel names what over.tasks fingerprints, so a SWE-bench instance set is
+// not printed as task directories.
+func unitLabel(mode string) string {
+	switch mode {
+	case "swebench":
+		return "instance ids"
+	case "diff":
+		return "changed source files"
+	default:
+		return "task ids"
+	}
 }
 
 func writeFigures(b *strings.Builder, figures []auditFigure) {
@@ -336,6 +502,18 @@ func axisText(axes []batchFlag) string {
 		parts[i] = a.Name + "=" + a.Value
 	}
 	return "`" + strings.Join(parts, "` · `") + "`"
+}
+
+// filterTextFor keeps the suite's wording and stops a SWE-bench or diff audit
+// from claiming a -task filter applies to it.
+func filterTextFor(mode string, f batchFilters) string {
+	if mode == "" || mode == "suite" {
+		return filterText(f)
+	}
+	if strings.TrimSpace(f.Task) == "" {
+		return "none in this mode"
+	}
+	return "`-task " + f.Task + "`"
 }
 
 func filterText(f batchFilters) string {

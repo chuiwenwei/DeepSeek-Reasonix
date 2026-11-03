@@ -19,6 +19,8 @@ type diffOpts struct {
 	bin, model, repo, base, testCmd, profile string
 	ablate                                   ablation.Set
 	maxSteps, timeoutSec, attempts           int
+	// batchDir retains one row per attempt plus batch.json for -mode audit.
+	batchDir string
 }
 
 type testRef struct{ name, pkg string }
@@ -39,6 +41,11 @@ type pinResult struct {
 func runDiff(o diffOpts) string {
 	srcFiles := changedGoFiles(o.repo, o.base, false)
 	if len(srcFiles) == 0 {
+		if o.batchDir != "" {
+			// No attempt is made, so there is no row and no evidence to retain;
+			// say so instead of writing a manifest with nothing behind it.
+			fmt.Fprintln(os.Stderr, "batch: no Go source changes in this PR; nothing to retain")
+		}
 		profile := o.profile
 		if profile == "" {
 			profile = benchmarkProfileBaseline
@@ -48,8 +55,17 @@ func runDiff(o diffOpts) string {
 	pkgs := packagesOf(srcFiles)
 	prompt := buildDiffPrompt(srcFiles, pkgs, truncate(gitOut(o.repo, "diff", o.base+"...HEAD", "--")))
 
+	// The PR is captured before the first attempt: the agent edits this tree,
+	// so git cannot describe the tree the batch started from afterwards.
+	var prov batchProvenance
+	if o.batchDir != "" {
+		prov = captureDiffProvenance(o, srcFiles)
+	}
+
 	attempts := max(o.attempts, 1)
 	var best diffReport
+	var rows []diffBatchRow
+	bestIdx := -1
 	made := 0
 	for i := 1; i <= attempts; i++ {
 		if i > 1 {
@@ -57,14 +73,27 @@ func runDiff(o diffOpts) string {
 		}
 		r := runOnce(o, srcFiles, pkgs, prompt)
 		made = i
+		rows = append(rows, newDiffBatchRow(r, i))
 		if i == 1 || better(r, best) {
 			best = r
+			bestIdx = len(rows) - 1
 		}
 		if best.passed {
 			break // stop at the first passing run; attempts is a retry budget
 		}
 	}
 	best.attempt, best.attempts = made, attempts
+	if o.batchDir != "" {
+		// Selected records which attempt the report renders, so a later audit
+		// does not have to re-implement better() to know the published verdict.
+		if bestIdx >= 0 {
+			rows[bestIdx].Selected = true
+		}
+		if err := writeDiffBatch(prov, rows); err != nil {
+			fmt.Fprintln(os.Stderr, "write batch:", err)
+			os.Exit(1)
+		}
+	}
 	return renderDiff(best)
 }
 
@@ -100,7 +129,7 @@ func runOnce(o diffOpts, srcFiles, pkgs []string, prompt string) diffReport {
 	// intent-to-add surfaces them as additions without committing.
 	_ = exec.Command("git", "-C", o.repo, "add", "-AN").Run()
 
-	m, _ := readMetrics(metricsPath)
+	m, metricsErr := readMetrics(metricsPath)
 	testDiff := gitOut(o.repo, "diff", "HEAD", "--", "*_test.go")
 	refs := parseNewTests(testDiff)
 	sourceTouched := len(changedGoFilesWorktree(o.repo, false))
@@ -128,7 +157,8 @@ func runOnce(o diffOpts, srcFiles, pkgs []string, prompt string) diffReport {
 		pins: pins, mut: mut, covered: covered, coverTotal: coverTotal,
 		buildOK: buildOK, buildOut: buildOut, failing: failingTestNames(testOut),
 		passed: passed, profile: o.profile, m: m, runErr: runErr, analysisErr: analysisErr,
-		testOut: testOut, testDiff: testDiff,
+		unaccounted: metricsErr != nil,
+		testOut:     testOut, testDiff: testDiff,
 	}
 }
 
@@ -209,8 +239,11 @@ type diffReport struct {
 	m                   runMetrics
 	runErr              error
 	analysisErr         error
-	testOut             string
-	testDiff            string
+	// unaccounted marks an attempt whose metrics file never landed: its cost
+	// and tokens are unknown, so the retained row keeps it out of spend totals.
+	unaccounted bool
+	testOut     string
+	testDiff    string
 }
 
 func renderDiff(r diffReport) string {

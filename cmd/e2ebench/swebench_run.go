@@ -30,6 +30,8 @@ type swebenchOpts struct {
 	timeoutSec int
 	workers    int
 	keepImages bool
+	// batchDir retains results.jsonl and batch.json for -mode audit.
+	batchDir string
 	// network is the isolated Docker network; proxyURL is the allowlisted API path.
 	network  string
 	proxyURL string
@@ -319,6 +321,12 @@ func runSwebench(o swebenchOpts) string {
 		fmt.Fprintln(os.Stderr, "load subset:", err)
 		os.Exit(1)
 	}
+	// Provenance is read before the first container: the tree a batch ends on
+	// is not necessarily the tree it started from.
+	var prov batchProvenance
+	if o.batchDir != "" {
+		prov = captureSwebenchProvenance(o, instances)
+	}
 
 	patches := map[string]string{}
 	order := make([]string, 0, len(instances))
@@ -344,6 +352,12 @@ func runSwebench(o swebenchOpts) string {
 		// grader's generic "unresolved", so an agent-side outcome wins.
 		if results[i].Outcome == "" || results[i].Outcome == "success" {
 			results[i].Outcome = class
+		}
+	}
+	if o.batchDir != "" {
+		if err := writeSwebenchBatch(prov, results); err != nil {
+			fmt.Fprintln(os.Stderr, "write batch:", err)
+			os.Exit(1)
 		}
 	}
 	return renderSwebench(results, o)
