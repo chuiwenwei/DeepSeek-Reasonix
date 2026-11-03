@@ -3,6 +3,7 @@ package control
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"reasonix/internal/base/testenv"
@@ -120,6 +121,39 @@ func TestTurnStartedCarriesTheStoredAttachments(t *testing.T) {
 		if e.Kind == event.TurnStarted && e.AuthoredTurn != nil {
 			if len(e.Attachments) != 1 || e.Attachments[0].Path != rel {
 				t.Fatalf("turn_started attachments = %+v", e.Attachments)
+			}
+			return
+		}
+	}
+	t.Fatal("no authored turn_started")
+}
+
+// A message that is only an image names it on the live start too: the stored
+// file rides Attachments, which is the count a terminal that did not send the
+// turn has to draw it by. This is the live shape the transcript keeps.
+func TestTurnStartedCarriesAnImageOnlyMessagesAttachment(t *testing.T) {
+	workspace := testenv.TempDir(t)
+	rel := writeAttachment(t, workspace, "clipboard-20260101-000000.000000-000003.png")
+	dir := testenv.TempDir(t)
+	sess := sessionstore.NewSession("sys")
+	exec := agent.New(&turnIdentityProvider{}, tool.NewRegistry(), sess, agent.Options{}, event.Discard)
+	sink, done, events := collectSink()
+	c := New(Options{
+		Runner: exec, Executor: exec, Sink: sink, WorkspaceRoot: workspace,
+		SessionDir: dir, SessionPath: filepath.Join(dir, "s.jsonl"),
+	})
+	defer c.Close()
+	defer c.autosaveWG.Wait()
+
+	c.Submit("@" + rel)
+	waitForDone(t, done)
+	for _, e := range events() {
+		if e.Kind == event.TurnStarted && e.AuthoredTurn != nil {
+			if len(e.Attachments) != 1 || e.Attachments[0].Path != rel {
+				t.Fatalf("turn_started attachments = %+v, want the stored image", e.Attachments)
+			}
+			if strings.TrimSpace(e.Text) != "@"+rel {
+				t.Fatalf("turn_started text = %q, want the reference it carried", e.Text)
 			}
 			return
 		}

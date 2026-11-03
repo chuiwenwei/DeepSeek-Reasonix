@@ -493,7 +493,8 @@ func (it *Item) bookkeeping() bool {
 // nameTurnStart seats the message a turn began on. The oldest row this screen
 // sent and no turn has taken is the one: a follow-up that waited in the queue
 // moves to where its turn began. With none waiting, another client started
-// the turn, and the kernel's text is the only account of what was said.
+// the turn, and the kernel's text and attachments are the only account of what
+// was said.
 func (t *Transcript) nameTurnStart(ev eventwire.Event) {
 	if ev.AuthoredTurn == nil || ev.MsgIndex == nil {
 		return
@@ -515,11 +516,14 @@ func (t *Transcript) nameTurnStart(ev eventwire.Event) {
 		t.Items = append(append(t.Items[:at:at], t.Items[at+1:]...), row)
 		return
 	}
-	text := strings.TrimSpace(ev.Text)
-	if text == "" || slices.ContainsFunc(t.Items, func(it Item) bool { return it.Kind == ItemUser && it.MsgIndex == *ev.MsgIndex }) {
+	// The attachments are the turn's pictures, the same fact a restored row
+	// carries by its count: a turn that was only an image has no text to draw
+	// it by, and dropping it live would make a reload and a watch disagree.
+	text, images := strings.TrimSpace(ev.Text), len(ev.Attachments)
+	if (text == "" && images == 0) || slices.ContainsFunc(t.Items, func(it Item) bool { return it.Kind == ItemUser && it.MsgIndex == *ev.MsgIndex }) {
 		return
 	}
-	t.Items = append(t.Items, Item{ID: t.id(), Kind: ItemUser, Text: text, MsgIndex: *ev.MsgIndex})
+	t.Items = append(t.Items, Item{ID: t.id(), Kind: ItemUser, Text: text, MsgIndex: *ev.MsgIndex, Images: images})
 }
 
 // foldSteer moves pending input to where the turn read it: the work that ran
