@@ -83,8 +83,34 @@ hint. Multiple/unknown/error responses do not affect the cost facts.
 ```sh
 reasonix doctor billing
 reasonix doctor billing --json
+reasonix doctor billing --days 7
+reasonix doctor billing --from 2026-09-01 --to 2026-09-30 --json
 ```
 
 The compatible `fx` report is always `enabled=false` and has no cache. The
 report also lists the automatic selection policy, pricing-table currencies,
 and official-catalog matches.
+
+## Auditing the cards stored rows name
+
+Every usage row records `pricing_fingerprint`, the card that priced it. For the
+selected range (`--days`, default 30, or inclusive `--from`/`--to`) the report
+separates three facts:
+
+- `named a card`: rows carrying a fingerprint.
+- `unresolvable`: of those, rows whose fingerprint matches no published card.
+- `no card recorded`: rows with no fingerprint. Absence means unknown, never
+  today's card.
+
+A range the report cannot read is `unknown`, not zero: zero is a measurement
+and an unreadable range measured nothing. `--json` carries the same counts
+under `card_audit` (`known`, `rows`, `named`, `unresolvable`, `unrecorded`,
+`superseded_peak`, `note`); a count the report cannot know is absent.
+
+The one known unresolvable case today is a **superseded peak card**: the
+published history lists the base card of a superseded generation but not that
+generation's peak card.
+
+A row priced on one still names it, and the report says so rather than calling
+the record corrupt. Publishing those peak cards is the follow-up; this report
+is read-only and never reprices an amount or rewrites a rate table.

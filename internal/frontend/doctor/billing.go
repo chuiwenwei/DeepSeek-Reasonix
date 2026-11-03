@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"reasonix/internal/contract/config"
+	"reasonix/internal/state/stats"
 )
 
 // BillingReport is the structured output of `reasonix doctor billing`.
@@ -16,6 +17,42 @@ type BillingReport struct {
 	FX                  FXReport              `json:"fx"`
 	Providers           []ProviderBillingInfo `json:"providers"`
 	CatalogNotes        []string              `json:"catalog_notes,omitempty"`
+	// CardAudit reads the stored rows in the selected range back against the
+	// published card history. It is nil only when the caller asked for provider
+	// diagnostics alone; the CLI always fills it.
+	CardAudit *CardAuditReport `json:"card_audit,omitempty"`
+}
+
+// CardAuditReport is how the stored rows in a range account for the rate cards
+// that priced them. Named counts rows carrying a pricing_fingerprint and
+// Unresolvable is the subset no published card matches; Unrecorded counts rows
+// with no fingerprint at all. The three counts are pointers so an unreadable
+// range serializes as absent (unknown) instead of a measured zero.
+type CardAuditReport struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// Known is false when the stats records could not be read. The counts are
+	// then omitted, because the report cannot tell and must not claim zero.
+	Known          bool   `json:"known"`
+	Rows           int    `json:"rows"`
+	Named          *int   `json:"named,omitempty"`
+	Unresolvable   *int   `json:"unresolvable,omitempty"`
+	Unrecorded     *int   `json:"unrecorded,omitempty"`
+	SupersededPeak *int   `json:"superseded_peak,omitempty"`
+	Note           string `json:"note,omitempty"`
+}
+
+// BillingOptions selects the stored-row range the billing report audits.
+type BillingOptions struct {
+	// From and To select inclusive calendar days. A zero pair means the last
+	// Days days ending at Now (local time).
+	From, To time.Time
+	// Days is the trailing window when From/To are zero. Zero means 30.
+	Days int
+	// Now anchors a trailing window; zero means time.Now().
+	Now time.Time
+	// StatsDir overrides config.StatsDir(). Empty reads the configured root.
+	StatsDir string
 }
 
 // FXReport is retained for JSON compatibility. Runtime FX is intentionally
@@ -46,8 +83,10 @@ type ProviderBillingInfo struct {
 	CustomPrice     bool    `json:"custom_price"`
 }
 
-// CollectBilling builds a billing diagnostics report.
-func CollectBilling(cfg *config.Config) BillingReport {
+// CollectBillingWithOptions builds a billing diagnostics report and audits the
+// stored rows in opts' range. The report is read-only: it names the cards the
+// rows carry and never reprices an amount or rewrites a rate table.
+func CollectBillingWithOptions(cfg *config.Config, opts BillingOptions) BillingReport {
 	if cfg == nil {
 		cfg = config.Default()
 	}
@@ -58,6 +97,7 @@ func CollectBilling(cfg *config.Config) BillingReport {
 			Enabled: false,
 			Source:  "disabled",
 		},
+		CardAudit: collectCardAudit(opts),
 	}
 
 	for i := range cfg.Providers {
@@ -96,6 +136,52 @@ func CollectBilling(cfg *config.Config) BillingReport {
 		"Switching display_currency never rewrites provider billing_currency or list prices.",
 	}
 	return rep
+}
+
+// collectCardAudit reads the selected range and copies the counts into the
+// report. A read failure keeps Known false and leaves every count nil: the
+// report cannot tell, and a zero would claim it found nothing.
+func collectCardAudit(opts BillingOptions) *CardAuditReport {
+	dir := strings.TrimSpace(opts.StatsDir)
+	if dir == "" {
+		dir = config.StatsDir()
+	}
+	from, to := opts.window()
+	audit, err := stats.AuditCards(dir, from, to)
+	rep := &CardAuditReport{From: audit.From, To: audit.To}
+	if err != nil || !audit.Known {
+		return rep
+	}
+	rep.Known = true
+	rep.Rows = audit.Rows
+	named, unrecorded := audit.Named, audit.Unrecorded
+	unresolvable, supersededPeak := audit.Unresolvable, audit.SupersededPeak
+	rep.Named = &named
+	rep.Unrecorded = &unrecorded
+	rep.Unresolvable = &unresolvable
+	rep.SupersededPeak = &supersededPeak
+	rep.Note = audit.Note
+	return rep
+}
+
+// window resolves the inclusive range. Explicit days are whole calendar days;
+// a trailing window is whole local days so today's morning is not cut off.
+func (o BillingOptions) window() (time.Time, time.Time) {
+	if !o.From.IsZero() && !o.To.IsZero() {
+		from := time.Date(o.From.Year(), o.From.Month(), o.From.Day(), 0, 0, 0, 0, o.From.Location())
+		to := time.Date(o.To.Year(), o.To.Month(), o.To.Day(), 23, 59, 59, 0, o.To.Location())
+		return from, to
+	}
+	days := o.Days
+	if days <= 0 {
+		days = 30
+	}
+	now := o.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	to := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, now.Location())
+	return to.AddDate(0, 0, -(days - 1)), to
 }
 
 func prefLabel(pref string) string {
@@ -147,5 +233,29 @@ func RenderBillingText(r BillingReport) string {
 			fmt.Fprintf(&b, "    - %s\n", n)
 		}
 	}
+	if r.CardAudit != nil {
+		b.WriteString("\n  stored rows:\n")
+		fmt.Fprintf(&b, "    range: %s..%s\n", r.CardAudit.From, r.CardAudit.To)
+		if !r.CardAudit.Known {
+			b.WriteString("    cards: unknown (the stored rows could not be read)\n")
+		} else {
+			fmt.Fprintf(&b, "    rows: %d\n", r.CardAudit.Rows)
+			fmt.Fprintf(&b, "    named a card: %s\n", countText(r.CardAudit.Named))
+			fmt.Fprintf(&b, "    unresolvable: %s\n", countText(r.CardAudit.Unresolvable))
+			fmt.Fprintf(&b, "    no card recorded: %s\n", countText(r.CardAudit.Unrecorded))
+			if r.CardAudit.Note != "" {
+				fmt.Fprintf(&b, "    note: %s\n", r.CardAudit.Note)
+			}
+		}
+	}
 	return b.String()
+}
+
+// countText renders a count that may be unknown. A nil pointer is the report
+// saying it could not tell, which is not the same as zero.
+func countText(n *int) string {
+	if n == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", *n)
 }

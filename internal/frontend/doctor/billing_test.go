@@ -10,7 +10,7 @@ import (
 func TestCollectBillingIncludesProvidersAndDisplay(t *testing.T) {
 	cfg := config.Default()
 	cfg.Billing.DisplayCurrency = "CNY"
-	rep := CollectBilling(cfg)
+	rep := CollectBillingWithOptions(cfg, BillingOptions{})
 	if rep.DisplayCurrency != "CNY" {
 		t.Fatalf("display = %q", rep.DisplayCurrency)
 	}

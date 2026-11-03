@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"reasonix/internal/contract/config"
 	"reasonix/internal/frontend/doctor"
@@ -16,15 +17,32 @@ func doctorBillingCommand(args []string) int {
 	fs := flag.NewFlagSet("doctor billing", flag.ContinueOnError)
 	jsonOut := fs.Bool("json", false, "print billing diagnostics as JSON")
 	root := fs.String("root", ".", "project root for config resolution")
+	days := fs.Int("days", 30, "trailing days of stored rows to audit (1-365)")
+	fromRaw := fs.String("from", "", "inclusive start date of stored rows (YYYY-MM-DD)")
+	toRaw := fs.String("to", "", "inclusive end date of stored rows (YYYY-MM-DD)")
 	if code, ok := parseCommandFlags(fs, args); !ok {
 		return code
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "usage: reasonix doctor billing [--root PATH] [--json] [--days N | --from YYYY-MM-DD --to YYYY-MM-DD]")
+		return 2
+	}
+	daysSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "days" {
+			daysSet = true
+		}
+	})
+	opts, ok := billingRangeOptions(*days, daysSet, *fromRaw, *toRaw)
+	if !ok {
+		return 2
 	}
 	cfg, err := config.LoadForRoot(*root)
 	if err != nil {
 		// Still report with defaults so doctor stays useful offline.
 		cfg = config.Default()
 	}
-	report := doctor.CollectBilling(cfg)
+	report := doctor.CollectBillingWithOptions(cfg, opts)
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -36,6 +54,44 @@ func doctorBillingCommand(args []string) int {
 	}
 	fmt.Print(doctor.RenderBillingText(report))
 	return 0
+}
+
+// billingRangeOptions turns the date flags into the report's range. Explicit
+// dates describe calendar days, so they are parsed without a zone; the stats
+// query keys on the formatted day.
+func billingRangeOptions(days int, daysSet bool, fromRaw, toRaw string) (doctor.BillingOptions, bool) {
+	const layout = "2006-01-02"
+	fromRaw, toRaw = strings.TrimSpace(fromRaw), strings.TrimSpace(toRaw)
+	if fromRaw == "" && toRaw == "" {
+		if days < 1 || days > 365 {
+			fmt.Fprintln(os.Stderr, "error: --days must be between 1 and 365")
+			return doctor.BillingOptions{}, false
+		}
+		return doctor.BillingOptions{Days: days}, true
+	}
+	if fromRaw == "" || toRaw == "" {
+		fmt.Fprintln(os.Stderr, "error: --from and --to must be provided together")
+		return doctor.BillingOptions{}, false
+	}
+	if daysSet {
+		fmt.Fprintln(os.Stderr, "error: --days cannot be combined with --from/--to")
+		return doctor.BillingOptions{}, false
+	}
+	from, err := time.Parse(layout, fromRaw)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: --from must be YYYY-MM-DD")
+		return doctor.BillingOptions{}, false
+	}
+	to, err := time.Parse(layout, toRaw)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: --to must be YYYY-MM-DD")
+		return doctor.BillingOptions{}, false
+	}
+	if to.Before(from) || from.Before(to.AddDate(0, 0, -364)) {
+		fmt.Fprintln(os.Stderr, "error: the range must be between 1 and 365 days")
+		return doctor.BillingOptions{}, false
+	}
+	return doctor.BillingOptions{From: from, To: to}, true
 }
 
 func doctorCommand(args []string, version string) int {
